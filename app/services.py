@@ -1,16 +1,30 @@
-"""业务编排：上传入库、作业触发、取数视图组装。"""
+"""业务编排：流式上传入库、作业触发、取数视图组装。
+
+内存与事务边界（改造重点）：
+- 接收阶段分块把上传流落盘到暂存区，边读边算 SHA-256 与大小，常驻内存只有一个块；
+- 解码、整份基站ID 查重、规范化写盘全部基于磁盘流式进行，期间不打开正式库的写事务，
+  其他业务日（乃至同业务日的不同类型）上传不受影响；
+- 规范化文件 fsync 完整持久化之后，才在一个短事务内共同提交
+  “文件版本 + 重算作业”，并在同一事务里把暂存文件原子改名到正式目录；
+- 任一步失败都只清理本次暂存，正式文件、作业、结果保持不变。
+"""
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import sqlite3
-from typing import Optional
+from typing import BinaryIO, Optional, Tuple
 
-from . import config, repository
-from .csvparser import ParsedCSV, parse_csv
+from . import config, repository, staging
+from .csvparser import stream_ingest
 from .db import transaction
+from .errors import UploadError
 from .schemas import DaySummary, DistrictResult, FileInfo, JobProgress, ResultResponse
+
+# 显式保留内建 open 的模块级引用，便于测试注入写盘故障
+_open = open
 
 
 def _file_info(row: sqlite3.Row) -> FileInfo:
@@ -25,54 +39,123 @@ def _file_info(row: sqlite3.Row) -> FileInfo:
     )
 
 
-def _stored_path(business_date: str, file_type: str, version: int, digest: str) -> str:
+def _final_stored_path(business_date: str, file_type: str, version: int, digest: str) -> str:
     day_dir = config.storage_dir() / business_date
     day_dir.mkdir(parents=True, exist_ok=True)
     return str(day_dir / f"{file_type}_v{version}_{digest[:12]}.csv")
 
 
-def store_upload(conn: sqlite3.Connection, business_date: str, file_type: str,
-                 filename: str, raw: bytes) -> tuple[int, JobProgress | None]:
-    """校验并落盘一份新文件，必要时作废在途作业并触发重算。
+def _stream_raw_to_staging(source: BinaryIO, raw_path, max_bytes: int) -> Tuple[str, int]:
+    """分块读取上传流写入暂存原件，逐块累计 SHA-256 与字节数。
 
-    返回 (file_id, 新作业进度或 None)。校验失败抛 UploadError，现有数据不动。
+    内存占用固定为一个块（``UPLOAD_CHUNK_BYTES``），与文件总行数/总大小无关。
+    超过上限立即拒收，不落完整文件。
     """
-    if len(raw) > config.max_upload_bytes():
-        from .errors import UploadError
-        raise UploadError(
-            "FILE_TOO_LARGE",
-            f"文件 {len(raw)} 字节超过上限 {config.max_upload_bytes()} 字节",
-        )
-    parsed: ParsedCSV = parse_csv(raw, file_type)
-    digest = hashlib.sha256(raw).hexdigest()
+    digest = hashlib.sha256()
+    total = 0
+    chunk_size = config.upload_chunk_bytes()
+    with _open(raw_path, "wb") as raw_fh:
+        while True:
+            chunk = source.read(chunk_size)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise UploadError(
+                    "FILE_TOO_LARGE",
+                    f"文件超过上限 {max_bytes} 字节（已接收 {total} 字节），整份拒收",
+                )
+            digest.update(chunk)
+            raw_fh.write(chunk)
+        raw_fh.flush()
+        os.fsync(raw_fh.fileno())
+    if total == 0:
+        raise UploadError("EMPTY_FILE", "上传文件为空")
+    return digest.hexdigest(), total
 
-    new_job: Optional[JobProgress] = None
-    with transaction(conn):
-        version = repository.next_version(conn, business_date, file_type)
-        path = _stored_path(business_date, file_type, version, digest)
-        # 规范化落盘：UTF-8、逻辑列顺序，worker 之后无需再嗅探编码与表头
-        tmp_path = f"{path}.tmp"
-        with open(tmp_path, "w", encoding="utf-8", newline="") as fh:
-            fh.write(",".join(parsed.header) + "\n")
-            for row in parsed.rows:
-                fh.write(",".join(row) + "\n")
-        os.replace(tmp_path, path)
 
-        file_id = repository.insert_file(
-            conn, business_date, file_type, path, filename,
-            len(raw), parsed.row_count, digest,
-        )
+def ingest_upload_stream(
+    conn: sqlite3.Connection,
+    business_date: str,
+    file_type: str,
+    filename: str,
+    source: BinaryIO,
+) -> Tuple[int, Optional[JobProgress]]:
+    """流式接收、校验、规范化并原子提交一份新文件。
 
-        traffic = repository.get_current_file(conn, business_date, "traffic")
-        ownership = repository.get_current_file(conn, business_date, "ownership")
-        if traffic is not None and ownership is not None:
-            # 旧结果立即失效：在途作业全部作废，按当前两份文件重新排队
-            repository.supersede_active_jobs(conn, business_date)
-            job_id = repository.enqueue_job(
-                conn, business_date, traffic["id"], ownership["id"])
-            row = repository.get_job(conn, job_id)
-            new_job = build_job_progress(conn, row)
-    return file_id, new_job
+    返回 (file_id, 新作业进度或 None)。任何校验/写盘失败抛 :class:`UploadError`，
+    现有版本、作业与结果均不变，本次暂存被清理。
+    """
+    max_bytes = config.max_upload_bytes()
+    paths = staging.StagingPaths.create()
+    dedup = staging.SqliteDedup(str(paths.dedup_db_path))
+    try:
+        # 1) 流式接收：内存只有一个块；超限/空文件在此即拒收
+        digest, size_bytes = _stream_raw_to_staging(source, paths.raw_path, max_bytes)
+
+        # 2) 流式解码 + 磁盘查重 + 规范化写盘（不持有正式库写事务）
+        try:
+            with _open(paths.normalized_path, "w", encoding="utf-8", newline="") as norm_fh:
+                stats = stream_ingest(
+                    str(paths.raw_path), file_type, norm_fh, dedup,
+                )
+                # 规范化内容必须完整落到磁盘，后续才允许提交
+                norm_fh.flush()
+                os.fsync(norm_fh.fileno())
+            dedup.commit()  # 查重事务仅在整份校验通过后提交
+        except UploadError:
+            raise
+        except OSError as exc:
+            raise UploadError("WRITE_FAILED", f"规范化文件写盘失败，整份拒收：{exc!r}")
+
+        # 3) 短事务共同提交：文件版本 + 重算作业，改名在事务内原子完成
+        try:
+            with transaction(conn):
+                version = repository.next_version(conn, business_date, file_type)
+                final_path = _final_stored_path(business_date, file_type, version, digest)
+                file_id = repository.insert_file(
+                    conn, business_date, file_type, version, final_path, filename,
+                    size_bytes, stats.row_count, digest,
+                )
+                try:
+                    os.replace(str(paths.normalized_path), final_path)
+                    staging.fsync_dir(config.storage_dir() / business_date)
+                except OSError as exc:
+                    # 改名失败：事务回滚，files 行不会留下，正式数据不变
+                    raise UploadError(
+                        "WRITE_FAILED", f"规范化文件落盘失败，整份拒收：{exc!r}"
+                    )
+
+                new_job: Optional[JobProgress] = None
+                traffic = repository.get_current_file(conn, business_date, "traffic")
+                ownership = repository.get_current_file(conn, business_date, "ownership")
+                if traffic is not None and ownership is not None:
+                    # 旧结果立即失效：在途作业全部作废，按当前两份文件重新排队
+                    repository.supersede_active_jobs(conn, business_date)
+                    job_id = repository.enqueue_job(
+                        conn, business_date, traffic["id"], ownership["id"])
+                    row = repository.get_job(conn, job_id)
+                    new_job = build_job_progress(conn, row)
+        except UploadError:
+            raise
+
+        return file_id, new_job
+    finally:
+        dedup.remove()
+        paths.cleanup()
+
+
+def ingest_upload_bytes(
+    conn: sqlite3.Connection,
+    business_date: str,
+    file_type: str,
+    filename: str,
+    raw: bytes,
+) -> Tuple[int, Optional[JobProgress]]:
+    """字节数组便捷封装（测试/小文件用），内部仍走同一套流式管道。"""
+    return ingest_upload_stream(
+        conn, business_date, file_type, filename, io.BytesIO(raw),
+    )
 
 
 def build_job_progress(conn: sqlite3.Connection, row: sqlite3.Row) -> JobProgress:

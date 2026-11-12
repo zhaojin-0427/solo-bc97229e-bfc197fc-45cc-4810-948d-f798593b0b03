@@ -37,13 +37,15 @@ def insert_file(
     conn: sqlite3.Connection,
     business_date: str,
     file_type: str,
+    version: int,
     stored_path: str,
     original_name: str,
     size_bytes: int,
     row_count: int,
     sha256: str,
 ) -> int:
-    version = next_version(conn, business_date, file_type)
+    """插入一个文件版本。version 由调用方在同一事务内用 next_version 预先取得，
+    以便规范化文件命名与入库版本号严格一致（共同提交）。"""
     cur = conn.execute(
         "INSERT INTO files (business_date, file_type, version, stored_path, original_name, "
         "size_bytes, row_count, sha256) VALUES (?,?,?,?,?,?,?,?)",

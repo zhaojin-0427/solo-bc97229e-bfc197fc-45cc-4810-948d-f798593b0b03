@@ -13,7 +13,7 @@ from typing import List, Optional
 from fastapi import FastAPI, File, HTTPException, Path as PathParam, Query, UploadFile
 from fastapi.responses import HTMLResponse
 
-from . import config, repository, services
+from . import config, repository, services, staging
 from .db import connect, init_db
 from .errors import UploadError
 from .schemas import (
@@ -30,10 +30,33 @@ _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _VALID_TYPES = {"traffic", "ownership"}
 
 
+def _recover_persistent_state() -> None:
+    """启动恢复：保证不出现“版本引用缺失文件”，并清掉未提交残留。
+
+    1. 清空暂存目录：里面只有未提交的接收产物，绝不可能被正式库引用；
+    2. 清扫正式目录中没有任何 files 行引用的孤儿文件（提交前崩溃的残留），
+       已提交/历史版本文件一律保留；
+    3. 体检：若仍有数据库引用指向缺失文件，记录错误便于运维介入
+       （正常崩溃窗口下不会发生，因为引用与改名在同一事务内提交）。
+    """
+    staging.wipe_staging_dir()
+    conn = connect()
+    try:
+        removed = staging.sweep_orphan_files(conn)
+        for path in removed:
+            print(f"[startup] 清理未提交的孤儿文件：{path}")
+        missing = staging.check_referenced_files(conn)
+        for path in missing:  # 正常流程不应出现：出现意味着卷被外部破坏
+            print(f"[startup][ERROR] 数据库引用的文件缺失：{path}")
+    finally:
+        conn.close()
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # 启动：建表、恢复中断作业、拉起后台 worker
+    # 启动：建表、崩溃恢复、恢复中断作业、拉起后台 worker
     init_db()
+    _recover_persistent_state()
     if config.background_worker_enabled():
         worker.start()
     try:
@@ -44,13 +67,15 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="基站流量入仓服务",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
     description=(
         "按业务日接收基站流量 CSV 与片区归属 CSV，两份到齐后后台按片区汇总。\n\n"
+        "- 流式接收/解码/基站ID 查重/规范化写盘，内存占用只与块大小有关，不随总行数增长；\n"
+        "- 校验规范化期间不占正式库写事务，其他业务日可正常上传；\n"
+        "- 规范化文件完整持久化后，文件版本与重算作业在同一短事务共同提交，崩溃可恢复；\n"
         "- 任一文件可整份替换，替换成功后旧结果立即失效并自动重算；\n"
         "- 计算期间可继续上传与查询，迟到的旧作业不会发布结果；\n"
-        "- 输入、作业、结果全部持久化，重启后接续未完成作业；\n"
         "- 取数只返回当前两份文件对应的完整结果，未就绪时明确说明原因。"
     ),
 )
@@ -93,6 +118,9 @@ def index() -> HTMLResponse:
         <body>
         <h1>基站流量入仓服务</h1>
         <p>按业务日接收流量 CSV 与归属 CSV，两份到齐后后台按片区分组求和。</p>
+        <p>大文件友好：接收、解码、全文件基站ID 查重与规范化写盘全程流式，
+        内存不随总行数增长；校验期间不占正式库写事务，文件版本与重算作业在
+        规范化文件完整落盘后共同提交，进程终止重启可自动清理未提交暂存且不误删已提交文件。</p>
         <h2>演示步骤（在 <a href="/docs">Swagger UI</a> 中操作）</h2>
         <ol>
           <li><code>POST /days/2026-11-12/files/traffic</code> 上传流量 CSV</li>
@@ -131,11 +159,11 @@ def upload_file(
             "code": "INVALID_FILE_TYPE",
             "message": f"file_type 必须是 {sorted(_VALID_TYPES)} 之一",
         })
-    raw = file.file.read()
+    # 直接传递文件流：服务层分块落盘，内存不随文件大小/总行数增长
     conn = connect()
     try:
-        _file_id, new_job = services.store_upload(
-            conn, business_date, file_type, file.filename or "upload.csv", raw,
+        _file_id, new_job = services.ingest_upload_stream(
+            conn, business_date, file_type, file.filename or "upload.csv", file.file,
         )
         stored_row = repository.get_current_file(conn, business_date, file_type)
         both = (repository.get_current_file(conn, business_date, "traffic") is not None

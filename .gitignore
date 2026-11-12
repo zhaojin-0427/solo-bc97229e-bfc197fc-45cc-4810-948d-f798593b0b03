@@ -7,4 +7,5 @@ data/
 *.db-shm
 .venv/
 venv/
+.pydeps/
 .DS_Store

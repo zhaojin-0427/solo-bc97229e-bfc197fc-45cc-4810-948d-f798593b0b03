@@ -1,14 +1,17 @@
 services:
   warehouse:
     build: .
-    image: cell-traffic-warehouse:1.0.0
+    image: cell-traffic-warehouse:2.0.0
     container_name: cell-traffic-warehouse
     ports:
       - "8000:8000"
     environment:
       DATA_DIR: /data
       WORKER_POLL_INTERVAL: "0.15"
+      # 单次上传字节上限；流式接收按块判定，超限立即拒收，不缓存整份文件
       MAX_UPLOAD_BYTES: "104857600"
+      # 流式接收块大小（1 MiB）：常驻内存只与块大小有关，不随总行数增长
+      UPLOAD_CHUNK_BYTES: "1048576"
     volumes:
       - warehouse-data:/data
     restart: unless-stopped

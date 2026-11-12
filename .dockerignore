@@ -8,3 +8,4 @@ data/
 *.db-shm
 .venv/
 venv/
+.pydeps/
